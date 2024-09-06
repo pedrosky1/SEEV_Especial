@@ -1,0 +1,595 @@
+/*
+Nome ALUNO A - André Ribeiro
+Nome ALUNO B - Pedro Borja
+IPLEIRIA - Instituto Politécnico de Leiria
+ESTG - Escola Superior de Tecnologia e Gestão
+LEAU - Licenciatura em Engenharia Automóvel
+SEEV - Sistemas Elétricos e Eletrónicos de Veículos
+Github:
+Youtube:https://youtu.be/Zbt91N5555s?si=AR6Do6-rdKAHD8bf
+*/
+#include "Arduino.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "U8g2lib.h"
+#include <Wire.h>
+
+// Definir los pines
+#define BUTTON_PIN 14          // Botón para encender/apagar el motor
+#define SPEED_BUTTON_PIN 12    // Botón para cambiar la velocidad del motor
+#define DECREASE_BUTTON_PIN 5    // Botón para disminuir la velocidad del motor
+#define BLUE_LED_PIN 26        // LED azul
+#define GREEN_LED_PIN 15       // LED verde
+#define RED_LED_PIN 33         // LED rojo
+#define MOTOR_PIN1 27          // Pin de control IN1 del L293D
+#define MOTOR_PIN2 25          // Pin de control IN2 del L293D
+#define MOTOR_ENABLE_PIN 32    // Pin de Enable (PWM) del L293D
+#define PWM_CHANNEL 0          // Canal PWM
+#define BUZZER_PIN 4           // Pin para el buzzer
+#define HALL_SENSOR_PIN 13     // Pin del sensor Hall
+#define UP_SHIFT_PIN 19        // Botón para subir de marcha
+#define DOWN_SHIFT_PIN 18        // Botón para bajar de marcha
+//proteger valores errados sensor hall
+#define DEBOUNCE_MICROS 2000  // Ignorar pulsos que ocurran en menos de 2000 microsegundos
+
+
+// Declarar las colas para la comunicación entre la interrupción y las tareas
+QueueHandle_t xQueueButtonPress;	//Queue que comunica a interrupção com a tarefa de ligar/desligar botão
+QueueHandle_t xQueueSpeedButtonPress;	//Queue comunica a interrupção do botão com a tarefa de aumentar velocidade
+QueueHandle_t xQueueDecreaseButtonPress;	//Queue comunica a interrupção do botão com a tarefa de reducir velocidade
+QueueHandle_t xQueueSpeedData;	//Queue comunica a velocidade obtida pelo sensor hall
+QueueHandle_t xQueuePWMValue;	//Queue que recive informação sobre o valor do pwm, que vai ser utilizada para controlar a velocidade do motor
+
+QueueHandle_t xQueueShiftUp;	//Queue comunica a interrupção do botão de aumentar marcha com a sua tarefa
+QueueHandle_t xQueueShiftDown;	//Queue comunica a interrupção do botão de reduzir marcha com a sua tarefa
+
+SemaphoreHandle_t xSemaphoreMotor;	//semaforo que contorla a comunicação com o motor
+SemaphoreHandle_t xSemaphoreLED;	//semáforo de comunicação da tarefa de controlo dos leds
+SemaphoreHandle_t xSemaphoreBuzzer;	//semáforo de comunicação da tarefa de controlo buzzer
+SemaphoreHandle_t xMutexSpeedControl; // Mutex para proteger el control de velocidad
+
+// Prototipos de funciones
+static void vTaskHandleButtonPress(void *pvParameters);	//Tarefa botão ligar/desligar
+static void vTaskHandleSpeedButtonPress(void *pvParameters);	//Tarefa aumentar velocidade
+static void vTaskHandleDecreaseButtonPress(void *pvParameters);	//Tarefa diminuir velocidade
+static void vTaskControlLEDs(void *pvParameters);	//Tarefa controlo LEds
+static void vTaskControlBuzzer(void *pvParameters);	//Tarefa control Buzzer
+static void vTaskMonitorRPM(void *pvParameters);	//Tarefa atualizar display
+static void vTaskHandleShiftUp(void *pvParameters);	//Tarefa aumentar mudança
+static void vTaskHandleShiftDown(void *pvParameters);	//Tarefa reduzir mudança
+//interrupciones
+void IRAM_ATTR isrButtonPress();	//Botão ligar/desligar
+void IRAM_ATTR isrSpeedButtonPress();	//Botão aumentar velocidade
+void IRAM_ATTR isrDecreaseButtonPress();	//Botão diminuir velocidade
+void IRAM_ATTR isrHallSensor();	//Sensor velocidade
+void IRAM_ATTR isrShiftUp();	//Botão aumentar mudança
+void IRAM_ATTR isrShiftDown();	//Botão reduzir mudança
+
+// Estructura para almacenar datos del sensor Hall en la cola
+struct HallSensorData {
+    unsigned long currentTime;
+    unsigned long timeDifference;
+};
+// Estructura para controlar el estado del motor y la velocidad
+typedef struct {
+	int pwmValue;
+	bool adjustingSpeed; // bandera para indicar si se está ajustando la velocidad
+} SpeedControlData;
+
+// Definir las marchas y la marcha actual
+typedef struct {
+    int currentGear;
+    int maxGears;
+    bool shiftUp;
+    bool shiftDown;
+} GearControlData;
+GearControlData gearControl = {1, 5};  // Comenzar en la primera marcha, con un máximo de 5 marchas
+
+// Inicializar display
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0);
+// Configuración inicial
+void setup() {
+    Serial.begin(115200);
+
+    // Inicializar el display
+    u8g2.begin();
+
+    // Configurar los pines del botón, los LEDs, el motor, el buzzer y el sensor Hall
+    pinMode(BUTTON_PIN, INPUT_PULLUP);	//Encender/Apagar
+    pinMode(SPEED_BUTTON_PIN, INPUT_PULLUP);	//Aumentar velocidad
+    pinMode(DECREASE_BUTTON_PIN, INPUT_PULLUP);	//Disminuir velocidad
+    pinMode(BLUE_LED_PIN, OUTPUT);	//Led Azul
+    pinMode(GREEN_LED_PIN, OUTPUT);	//Led Verde
+    pinMode(RED_LED_PIN, OUTPUT);	//Led Rojo
+    pinMode(MOTOR_PIN1, OUTPUT);	//Positivo motor
+    pinMode(MOTOR_PIN2, OUTPUT);	//Negativo Motor
+    pinMode(MOTOR_ENABLE_PIN, OUTPUT);	//PWM motor
+    pinMode(BUZZER_PIN, OUTPUT);	//Buzzer
+    pinMode(HALL_SENSOR_PIN, INPUT);	//Sensor Hall
+    pinMode(UP_SHIFT_PIN, INPUT_PULLUP);	//Aumentar marcha
+    pinMode(DOWN_SHIFT_PIN, INPUT_PULLUP);	//Reducir marcha
+
+    // Configurar PWM en el ESP32
+    ledcSetup(PWM_CHANNEL, 5000, 8);  // Canal PWM 0, frecuencia 5kHz, resolución 8 bits
+    ledcAttachPin(MOTOR_ENABLE_PIN, PWM_CHANNEL);
+    ledcWrite(PWM_CHANNEL, 64);  // PWM al 25% inicialmente
+
+    // Apagar todos los LEDs, el motor y el buzzer inicialmente
+    digitalWrite(BLUE_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(MOTOR_PIN1, LOW);
+    digitalWrite(MOTOR_PIN2, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // Inicializar la estructura control de marcha con valores iniciales
+      gearControl.currentGear = 1;  // Marcha inicial
+      gearControl.maxGears = 5;     // Máximo de marchas
+      gearControl.shiftUp = false;
+      gearControl.shiftDown = false;
+
+    // Crear las colas para almacenar el estado de los botones y la velocidad del motor
+    xQueueButtonPress = xQueueCreate(10, sizeof(bool));
+    xQueueSpeedButtonPress = xQueueCreate(10, sizeof(bool));
+    xQueueDecreaseButtonPress = xQueueCreate(10, sizeof(bool));
+    xQueueSpeedData = xQueueCreate(10, sizeof(float));
+    xQueuePWMValue = xQueueCreate(10, sizeof(int));  // Cola para almacenar el valor PWM
+    xQueueShiftUp = xQueueCreate(10, sizeof(bool));  // Cola para cambio de marcha hacia arriba
+    xQueueShiftDown = xQueueCreate(10, sizeof(bool));  // Cola para cambio de marcha hacia abajo
+
+    // Crear los semáforos para proteger el estado del motor, la velocidad y los LEDs
+    xSemaphoreMotor = xSemaphoreCreateBinary();
+    xSemaphoreLED = xSemaphoreCreateBinary();
+    xSemaphoreBuzzer = xSemaphoreCreateBinary();
+    xMutexSpeedControl = xSemaphoreCreateMutex();
+
+    xSemaphoreGive(xSemaphoreMotor);
+    xSemaphoreGive(xSemaphoreLED);
+    xSemaphoreGive(xSemaphoreBuzzer);
+
+    if (xQueueButtonPress != NULL && xQueueSpeedButtonPress != NULL &&
+        xQueueDecreaseButtonPress != NULL && xQueueSpeedData != NULL &&
+        xQueuePWMValue != NULL && xQueueShiftUp != NULL && xQueueShiftDown != NULL &&
+         xSemaphoreMotor != NULL && xSemaphoreLED != NULL && xSemaphoreBuzzer != NULL && xMutexSpeedControl != NULL)
+    	{
+
+    	SpeedControlData initialSpeedData = {64, false};
+		xQueueSend(xQueueSpeedButtonPress, &initialSpeedData, portMAX_DELAY);
+		xQueueSend(xQueueDecreaseButtonPress, &initialSpeedData, portMAX_DELAY);
+
+        // Crear las tareas para manejar las interrupciones de los botones
+        xTaskCreatePinnedToCore(vTaskHandleButtonPress, "ButtonHandler", 4096, NULL, 3, NULL, 1);
+        xTaskCreatePinnedToCore(vTaskHandleSpeedButtonPress, "SpeedButtonHandler", 4096, NULL, 4, NULL, 1);
+        xTaskCreatePinnedToCore(vTaskHandleDecreaseButtonPress, "DecreaseButtonHandler", 4096, NULL, 4, NULL, 1);
+        // Crear tareas control de marchas
+        xTaskCreate(vTaskHandleShiftUp, "Shift Up Task", 4096, &gearControl, 4, NULL);
+        xTaskCreate(vTaskHandleShiftDown, "Shift Down Task", 40906, &gearControl, 4, NULL);
+        // Crear la tarea para controlar los LEDs
+        xTaskCreate(vTaskControlLEDs, "LED Control Task", 4096, NULL, 4, NULL);
+        // Crear la tarea para controlar el buzzer
+        xTaskCreate(vTaskControlBuzzer, "Buzzer Control Task", 4096, NULL, 4, NULL);
+        // Crear tarea actualizar display
+        xTaskCreate(vTaskMonitorRPM, "RPM Monitor Task", 4096, &gearControl, 2, NULL);
+
+        // Adjuntar la interrupción a los pines de los botones y el sensor Hall
+        attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), isrButtonPress, FALLING);
+        attachInterrupt(digitalPinToInterrupt(SPEED_BUTTON_PIN), isrSpeedButtonPress, FALLING);
+        attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), isrHallSensor, FALLING);
+        attachInterrupt(digitalPinToInterrupt(DECREASE_BUTTON_PIN), isrDecreaseButtonPress, FALLING);
+        attachInterrupt(digitalPinToInterrupt(UP_SHIFT_PIN), isrShiftUp, FALLING);
+        attachInterrupt(digitalPinToInterrupt(DOWN_SHIFT_PIN), isrShiftDown, FALLING);
+    } else {
+        Serial.println("Error al crear la cola o los semáforos");
+    }
+}
+
+// Interrupción que se activa al presionar el botón de encendido/apagado del motor
+void IRAM_ATTR isrButtonPress() {
+    bool buttonPressed = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xQueueSendFromISR(xQueueButtonPress, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+// Interrupción que se activa al presionar el botón de disminución de velocidad del motor
+void IRAM_ATTR isrDecreaseButtonPress() {
+    bool buttonPressed = true;
+    SpeedControlData speedData;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    speedData.adjustingSpeed = false;  // Indicar que se necesita ajustar la velocidad
+
+    xQueueSendFromISR(xQueueDecreaseButtonPress, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Interrupción que se activa al presionar el botón de cambio de velocidad del motor
+void IRAM_ATTR isrSpeedButtonPress() {
+    bool buttonPressed = true;
+    SpeedControlData speedData;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    speedData.adjustingSpeed = false;  // Indicar que se necesita ajustar la velocidad
+
+    xQueueSendFromISR(xQueueSpeedButtonPress, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Interrupción que se activa con el sensor Hall para medir la velocidad del motor, a su vez es efectuado el calculo de velocidad
+void IRAM_ATTR isrHallSensor() {
+    static unsigned long lastPulseTime = 0;
+    unsigned long currentTime = micros();
+    unsigned long timeDifference;
+
+    // Manejo del desbordamiento de micros()
+    if (currentTime >= lastPulseTime) {
+        timeDifference = currentTime - lastPulseTime;
+    } else {
+        timeDifference = (4294967295UL - lastPulseTime + currentTime);
+    }
+
+    // Debounce: Ignorar pulsos que ocurren en un tiempo muy corto
+    if (timeDifference > DEBOUNCE_MICROS) {
+        lastPulseTime = currentTime;
+
+        // Proteger contra valores no razonables
+        if (timeDifference < 1000000) {  // Ignorar tiempos mayores a 1 segundo
+            float rpm = (1.0 / timeDifference) * 60.0 * 1000000.0;
+
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xQueueSendFromISR(xQueueSpeedData, &rpm, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+    }
+}
+
+// Interrupción que se activa al presionar el botón de cambio de marcha hacia arriba
+void IRAM_ATTR isrShiftUp() {
+	bool buttonPressed = true;
+    GearControlData gearData;
+    gearData.shiftUp = digitalRead(UP_SHIFT_PIN) == LOW;
+    gearData.shiftDown = false;  // No se está bajando la marcha
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(xQueueShiftUp, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+// Interrupción que se activa al presionar el botón de cambio de marcha hacia abajo
+void IRAM_ATTR isrShiftDown() {
+	bool buttonPressed = true;
+    GearControlData gearData;
+    gearData.shiftUp = false;  // No se está subiendo la marcha
+    gearData.shiftDown = digitalRead(DOWN_SHIFT_PIN) == LOW;
+
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(xQueueShiftDown, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Tarea que maneja el mensaje de la cola y controla el motor
+static void vTaskHandleButtonPress(void *pvParameters) {
+    bool buttonPressed;
+
+    for (;;) {
+        if (xQueueReceive(xQueueButtonPress, &buttonPressed, portMAX_DELAY) == pdPASS) {
+            Serial.println("Interrupción ocurrida: Botón Motor");
+
+            // Alternar el estado del motor
+            if (xSemaphoreTake(xSemaphoreMotor, portMAX_DELAY) == pdTRUE) {
+                bool motorState = digitalRead(MOTOR_PIN1) == HIGH;
+                if (motorState) {
+                    // Apagar el motor
+                    digitalWrite(MOTOR_PIN1, LOW);
+                    digitalWrite(MOTOR_PIN2, LOW);
+                    // Apagar todos los LEDs
+                    digitalWrite(BLUE_LED_PIN, LOW);
+                    digitalWrite(GREEN_LED_PIN, LOW);
+                    digitalWrite(RED_LED_PIN, LOW);
+                    Serial.println("Motor APAGADO");
+                    // Limpia el buffer del display
+                    u8g2.clearBuffer();
+                } else {
+                    // Encender el motor
+                    digitalWrite(MOTOR_PIN1, HIGH);
+                    digitalWrite(MOTOR_PIN2, LOW);
+                    Serial.println("Motor ENCENDIDO");
+                }
+                xSemaphoreGive(xSemaphoreMotor);
+            }
+        }
+    }
+}
+// Tarea que maneja el botón de incremento de velocidad del motor
+static void vTaskHandleSpeedButtonPress(void *pvParameters) {
+    bool isMotorOn = false;
+    SpeedControlData speedData = {0, false};  // Inicializar estructura
+
+    for (;;) {
+        if (digitalRead(SPEED_BUTTON_PIN) == LOW) { // Verifica si el botón está presionado
+            isMotorOn = digitalRead(MOTOR_PIN1) == HIGH;
+            if (isMotorOn) {
+                Serial.println("Botón Incrementar Velocidad presionado");
+
+                vTaskPrioritySet(NULL, 5);  // Incrementar la prioridad temporalmente
+
+                if (xSemaphoreTake(xMutexSpeedControl, portMAX_DELAY) == pdTRUE) {
+                    speedData.pwmValue = ledcRead(PWM_CHANNEL);  // Leer el valor actual del PWM
+
+                    for (; digitalRead(SPEED_BUTTON_PIN) == LOW; vTaskDelay(pdMS_TO_TICKS(150))) {
+                        if (speedData.pwmValue < 255) {  // Aumentar la velocidad solo si no ha alcanzado el máximo
+                            speedData.pwmValue += 5;
+                            if (speedData.pwmValue > 255) {
+                                speedData.pwmValue = 255;  // Asegurar que no supere 255
+                            }
+                            ledcWrite(PWM_CHANNEL, speedData.pwmValue);
+                            Serial.print("Nueva velocidad del Motor: ");
+                            Serial.print(speedData.pwmValue * 100 / 255);
+                            Serial.println("%");
+                        }
+                    }
+
+                    xSemaphoreGive(xMutexSpeedControl);
+                }
+
+                vTaskPrioritySet(NULL, 4);  // Restaurar la prioridad original
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // Breve delay antes de volver a verificar
+    }
+}
+
+// Tarea que maneja el botón de decremento de velocidad del motor
+static void vTaskHandleDecreaseButtonPress(void *pvParameters) {
+    bool isMotorOn = false;
+    SpeedControlData speedData = {0, false};  // Inicializar estructura
+
+    for (;;) {
+        if (digitalRead(DECREASE_BUTTON_PIN) == LOW) { // Verifica si el botón está presionado
+            isMotorOn = digitalRead(MOTOR_PIN1) == HIGH;
+            if (isMotorOn) {
+                Serial.println("Botón Disminuir Velocidad presionado");
+
+                vTaskPrioritySet(NULL, 5);  // Incrementar la prioridad temporalmente
+
+                if (xSemaphoreTake(xMutexSpeedControl, portMAX_DELAY) == pdTRUE) {
+                    speedData.pwmValue = ledcRead(PWM_CHANNEL);  // Leer el valor actual del PWM
+
+                    for (; digitalRead(DECREASE_BUTTON_PIN) == LOW; vTaskDelay(pdMS_TO_TICKS(150))) {
+                        if (speedData.pwmValue > 0) {  // Disminuir la velocidad solo si no ha alcanzado el mínimo
+                            speedData.pwmValue -= 5;
+                            if (speedData.pwmValue < 0) {
+                                speedData.pwmValue = 0;  // Asegurar que no sea negativo
+                            }
+                            ledcWrite(PWM_CHANNEL, speedData.pwmValue);
+                            Serial.print("Nueva velocidad del Motor: ");
+                            Serial.print(speedData.pwmValue * 100 / 255);
+                            Serial.println("%");
+                        }
+                    }
+
+                    xSemaphoreGive(xMutexSpeedControl);
+                }
+
+                vTaskPrioritySet(NULL, 4);  // Restaurar la prioridad original
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // Breve delay antes de volver a verificar
+    }
+}
+// Aumentar marcha
+static void vTaskHandleShiftUp(void *pvParameters) {
+    GearControlData *gearData = (GearControlData *)pvParameters;  // Apunta a la estructura de marchas
+    SpeedControlData speedData;  // Estructura para el control del PWM y velocidad
+
+    for (;;) {
+        bool shiftUp;	//Bandeira que serve para indicar que vai executar uma mudança
+        float rpm;
+        int new_pwm = 100; //siempre que se aumenta de marcha, la nueva velocidad es 44% de pwm
+
+        Serial.println("Botón Aumentar marcha presionado");
+        if (xQueueReceive(xQueueShiftUp, &shiftUp, portMAX_DELAY) == pdPASS) {	//recive a cola da interrupção do botão
+            if (shiftUp && gearData->currentGear < gearData->maxGears) {
+
+                // Obtener la velocidad actual (RPM) desde la cola de velocidad
+                if (xQueuePeek(xQueueSpeedData, &rpm, portMAX_DELAY) == pdPASS) {
+                    // Verificar si las RPM están dentro del rango permitido
+                    if ((rpm > 700.0 && rpm < 3000.0) ) {
+
+                        // Aumentar la marcha
+                        gearData->currentGear++;
+                        Serial.print("Marcha cambiada a: ");
+                        Serial.println(gearData->currentGear);
+
+                        // Reducir el valor del PWM a 50% fijo
+                        if (xSemaphoreTake(xMutexSpeedControl, portMAX_DELAY) == pdTRUE) {
+                        	ledcWrite(PWM_CHANNEL, new_pwm);
+                            Serial.print("Nueva velocidad del Motor: ");
+                            Serial.print(new_pwm * 100 / 255);
+                            Serial.println("%");
+                            xSemaphoreGive(xMutexSpeedControl);
+                            }
+                        Serial.print("Nuevo valor PWM: ");
+                        Serial.println(new_pwm);
+                    } else {
+                        Serial.println("No se puede aumentar marcha: RPM fuera de rango.");
+                    }
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Breve delay
+    }
+}
+
+// Reducir marcha
+static void vTaskHandleShiftDown(void *pvParameters) {
+    GearControlData *gearData = (GearControlData *)pvParameters;  // Apunta a la estructura de marchas
+    SpeedControlData speedData;  // Estructura para el control del PWM y velocidad
+
+    for (;;) {
+        bool shiftDown;	//Bandeira que serve para indicar que vai executar uma mudança
+        float rpm;
+        int new_pwm = 190;
+
+        Serial.println("Botón Reducir Marcha presionado");
+        if (xQueueReceive(xQueueShiftDown, &shiftDown, portMAX_DELAY) == pdPASS) {
+            if (shiftDown && gearData->currentGear > 1) {
+
+                // Obtener la velocidad actual (RPM) desde la cola de velocidad
+                if (xQueuePeek(xQueueSpeedData, &rpm, portMAX_DELAY) == pdPASS) {
+                    // Verificar si las RPM están dentro del rango permitido
+                    if ((rpm > 350.0 && rpm < 3000.0) ) {
+
+                        // Reducir la marcha
+                        gearData->currentGear--;
+                        Serial.print("Marcha cambiada a: ");
+                        Serial.println(gearData->currentGear);
+
+                        // Aumentar el valor del PWM en un 25%
+                        if (xSemaphoreTake(xMutexSpeedControl, portMAX_DELAY) == pdTRUE) {
+                        	ledcWrite(PWM_CHANNEL, new_pwm);
+                            Serial.print("Nueva velocidad del Motor: ");
+                            Serial.print(new_pwm * 100 / 255);
+                            Serial.println("%");
+                            xSemaphoreGive(xMutexSpeedControl);
+                        }
+                        Serial.print("Nuevo valor PWM: ");
+                        Serial.println(new_pwm);
+                    } else {
+                        Serial.println("No se puede reducir marcha: RPM fuera de rango.");
+                    }
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Breve delay
+    }
+}
+
+// Tarea para controlar los LEDs y mostrar en monitor serial velocidad
+static void vTaskControlLEDs(void *pvParameters) {
+    bool isMotorOn = false;
+    float rpm;
+    float minValidRPM = 100.0;  // Umbral mínimo para considerar una lectura válida
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Hacer la tarea periódica
+        if (xQueueReceive(xQueueSpeedData, &rpm, portMAX_DELAY) == pdPASS) {
+            // Filtrar lecturas anómalas
+            if (rpm < minValidRPM) {
+                continue;  // Ignorar esta lectura
+            }
+
+            Serial.printf("Velocidad sensor Hall en RPM: %.2f\n", rpm);
+
+            // Control de LEDs según la velocidad
+            if (xSemaphoreTake(xSemaphoreLED, portMAX_DELAY) == pdTRUE) {
+                isMotorOn = digitalRead(MOTOR_PIN1) == HIGH;
+                if (isMotorOn) {
+                    if (rpm <= 500.0) {
+                        digitalWrite(BLUE_LED_PIN, LOW);
+                        digitalWrite(GREEN_LED_PIN, LOW);
+                        digitalWrite(RED_LED_PIN, LOW);
+                    } else if (rpm > 500.0 && rpm <= 700.0) {
+                        digitalWrite(BLUE_LED_PIN, HIGH);
+                        digitalWrite(GREEN_LED_PIN, LOW);
+                        digitalWrite(RED_LED_PIN, LOW);
+                    } else if (rpm > 700.0 && rpm <= 990.0) {
+                        digitalWrite(BLUE_LED_PIN, HIGH);
+                        digitalWrite(GREEN_LED_PIN, HIGH);
+                        digitalWrite(RED_LED_PIN, LOW);
+                    } else if (rpm > 990.0 && rpm < 3000.0) {
+                        digitalWrite(BLUE_LED_PIN, HIGH);
+                        digitalWrite(GREEN_LED_PIN, HIGH);
+                        digitalWrite(RED_LED_PIN, HIGH);
+                    }
+                } else {
+                    digitalWrite(BLUE_LED_PIN, LOW);
+                    digitalWrite(GREEN_LED_PIN, LOW);
+                    digitalWrite(RED_LED_PIN, LOW);
+                }
+                xSemaphoreGive(xSemaphoreLED);
+            }
+        }
+    }
+}
+
+// Tarea para controlar el buzzer
+static void vTaskControlBuzzer(void *pvParameters) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Hacer la tarea periódica
+
+        if (xSemaphoreTake(xSemaphoreBuzzer, portMAX_DELAY) == pdTRUE) {
+            bool isMotorOn = digitalRead(MOTOR_PIN1) == HIGH;
+
+            if ((isMotorOn) && (digitalRead(RED_LED_PIN) == HIGH )) {
+                digitalWrite(BUZZER_PIN, HIGH); // Activar el buzzer si el motor está encendido
+                vTaskDelay(pdMS_TO_TICKS(100));
+                digitalWrite(BUZZER_PIN, LOW);
+            } else {
+                digitalWrite(BUZZER_PIN, LOW); // Asegurarse de que el buzzer esté apagado si el motor está apagado
+            }
+
+            xSemaphoreGive(xSemaphoreBuzzer);
+        }
+    }
+}
+
+// Función para dibujar las barras del PWM
+void drawPWMBars(int pwm) {
+	pwm = pwm*100/255;
+    int startX = 0;      // Posición inicial en X para las barras
+    int startY = 20;     // Posición inicial en Y para las barras
+    int barWidth = 10;   // Ancho de cada barra
+    int barHeight = 5;   // Altura de cada barra
+    int numBars = pwm / 10; // Calcula el número de barras a dibujar, cada barra representa el 10% del PWM
+
+    // Dibujar las barras según el número calculado
+    for (int i = 0; i < numBars; i++) {
+        u8g2.drawBox(startX + (i * (barWidth + 2)), startY, barWidth, barHeight);
+    }
+}
+
+// Tarea para monitorear el estado del motor y actualizar display
+static void vTaskMonitorRPM(void *pvParameters) {
+    SpeedControlData speedData = {0, false};  // Inicializar estructura
+    GearControlData *gearData = (GearControlData *)pvParameters;  // Apunta a la estructura de marchas
+    int porcentaje_pwm = 0;
+    for (;;) {
+        // Obtener la marcha actual
+        int currentGear = gearData->currentGear;
+
+        // Obtener el valor del PWM (esto depende de cómo estás calculando o midiendo el PWM)
+        speedData.pwmValue = ledcRead(PWM_CHANNEL);  // Leer el valor actual del PWM
+        int currentPWM = speedData.pwmValue;
+        porcentaje_pwm = currentPWM*100/255;
+        // Limpia el buffer del display
+        u8g2.clearBuffer();
+
+        // Configura la fuente
+        u8g2.setFont(u8g2_font_ncenB08_tr); // Selecciona la fuente
+
+        // Crear una cadena con la marcha actual
+        char gearStr[20];
+        sprintf(gearStr, "Marcha: %d", currentGear);
+
+        // Dibuja la cadena en el display
+        u8g2.drawStr(0, 10, gearStr); // Dibuja el texto en la posición (0, 10)
+        u8g2.setCursor(0, 40);
+        u8g2.print("Velocidade motor");
+        u8g2.setCursor(0, 50);
+        u8g2.print("em percentagem: ");
+        u8g2.print(porcentaje_pwm);;
+        // Dibuja las barras representando el PWM
+        drawPWMBars(currentPWM);
+
+        // Envía el contenido del buffer al display
+        u8g2.sendBuffer();
+
+        // Espera un segundo antes de actualizar nuevamente
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// Bucle principal
+void loop() {
+    // Dejar el bucle vacío porque todo se maneja en las tareas
+}
